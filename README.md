@@ -182,7 +182,7 @@ The system automatically detects and classifies the following landmarks:
 
 ## License
 
-MIT License - See LICENSE file for details
+Apache-2.0 - See LICENSE file for details
 
 ## Contributing
 
