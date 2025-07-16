@@ -2,10 +2,16 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <cstdlib>
+#include <cmath>
 
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/float32_multi_array.hpp"
 #include "geometry_msgs/msg/pose2_d.hpp"
+#include "nav_msgs/msg/odometry.hpp"
+#include "tf2_ros/transform_broadcaster.h"
+#include "tf2/LinearMath/Quaternion.h"
+#include "geometry_msgs/msg/transform_stamped.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
 #include "whiteline_simulator_cpp/preprocessor.hpp"
@@ -19,8 +25,12 @@ public:
     WhitelineSimulatorNode()
     : Node("whiteline_simulator_node"), 
       preprocessor_(std::make_unique<Preprocessor>()),
-      robot_pose_(0.0, 0.0, 0.0),  // Start at origin
-      time_step_(0.0)
+      robot_pose_(-5.5, -1.8, 0.0),  // Start at touchline-penalty area intersection facing field center
+      odom_pose_(-5.5, -1.8, 0.0),   // Initialize odometry to same position
+      time_step_(0.0),
+      movement_state_(0),
+      state_duration_(0.0),
+      prev_robot_pose_(-5.5, -1.8, 0.0)
     {
         // Declare parameters
         this->declare_parameter<std::string>("whiteline_points_file", "soccer_field_points.txt");
@@ -40,8 +50,13 @@ public:
             "landmarks", 10);
         robot_pose_publisher_ = this->create_publisher<geometry_msgs::msg::Pose2D>(
             "robot_pose", 10);
+        odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>(
+            "odom", 10);
         marker_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
             "whiteline_markers", 10);
+            
+        // TF broadcaster
+        tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
         
         // Get parameters
         std::string whiteline_file = this->get_parameter("whiteline_points_file").as_string();
@@ -98,17 +113,16 @@ public:
 private:
     void timer_callback()
     {
-        // Simulate robot movement (figure-8 pattern on the soccer field)
-        time_step_ += robot_speed_;
+        // Slow forward movement for particle tracking experiment
+        updateSlowForwardMovement();
         
-        // Figure-8 pattern that covers different areas of the field
-        double t = time_step_ * 0.2;
-        robot_pose_.x = 4.0 * std::sin(t);
-        robot_pose_.y = 2.0 * std::sin(2 * t);
-        robot_pose_.theta = std::atan2(4.0 * std::cos(t), 4.0 * std::cos(2 * t));
+        // Increment time step for logging
+        time_step_ += 0.1;
         
-        // Publish current robot pose
+        // Publish current robot pose and odometry
         publish_robot_pose();
+        publish_odometry();
+        publish_tf();
         
         // Simulate white line detection
         std::vector<Point2f> visible_points = preprocessor_->simulate_white_line(
@@ -133,6 +147,16 @@ private:
                 "Robot at (%.2f, %.2f, %.2f rad), visible points: %zu, landmarks: %zu", 
                 robot_pose_.x, robot_pose_.y, robot_pose_.theta, visible_points.size(), visible_landmarks.size());
         }
+        
+        // Log odometry drift every 10 seconds for debugging
+        if (static_cast<int>(time_step_ * 10) % 100 == 0) {
+            double dx_error = robot_pose_.x - odom_pose_.x;
+            double dy_error = robot_pose_.y - odom_pose_.y;
+            double total_error = std::sqrt(dx_error * dx_error + dy_error * dy_error);
+            RCLCPP_INFO(this->get_logger(),
+                "Odometry vs Ground Truth - Error: %.3fm, True: (%.3f, %.3f), Odom: (%.3f, %.3f)",
+                total_error, robot_pose_.x, robot_pose_.y, odom_pose_.x, odom_pose_.y);
+        }
     }
     
     void publish_robot_pose()
@@ -142,6 +166,110 @@ private:
         pose_msg.y = robot_pose_.y;
         pose_msg.theta = robot_pose_.theta;
         robot_pose_publisher_->publish(pose_msg);
+    }
+    
+    void publish_odometry()
+    {
+        auto odom_msg = nav_msgs::msg::Odometry();
+        auto current_time = this->now();
+        
+        // Header
+        odom_msg.header.stamp = current_time;
+        odom_msg.header.frame_id = "odom";
+        odom_msg.child_frame_id = "base_link";
+        
+        // Position (use odometry estimate, not true pose)
+        odom_msg.pose.pose.position.x = odom_pose_.x;
+        odom_msg.pose.pose.position.y = odom_pose_.y;
+        odom_msg.pose.pose.position.z = 0.0;
+        
+        // Orientation (convert theta to quaternion)
+        double half_theta = odom_pose_.theta / 2.0;
+        odom_msg.pose.pose.orientation.x = 0.0;
+        odom_msg.pose.pose.orientation.y = 0.0;
+        odom_msg.pose.pose.orientation.z = std::sin(half_theta);
+        odom_msg.pose.pose.orientation.w = std::cos(half_theta);
+        
+        // Calculate velocity (simple difference using odometry)
+        static auto last_time = current_time;
+        static Pose prev_odom_pose = odom_pose_;
+        double dt = (current_time - last_time).seconds();
+        if (dt > 0.0) {
+            double dx = odom_pose_.x - prev_odom_pose.x;
+            double dy = odom_pose_.y - prev_odom_pose.y;
+            double dtheta = odom_pose_.theta - prev_odom_pose.theta;
+            
+            // Normalize angle difference
+            while (dtheta > M_PI) dtheta -= 2 * M_PI;
+            while (dtheta < -M_PI) dtheta += 2 * M_PI;
+            
+            odom_msg.twist.twist.linear.x = dx / dt;
+            odom_msg.twist.twist.linear.y = dy / dt;
+            odom_msg.twist.twist.angular.z = dtheta / dt;
+        } else {
+            odom_msg.twist.twist.linear.x = 0.0;
+            odom_msg.twist.twist.linear.y = 0.0;
+            odom_msg.twist.twist.angular.z = 0.0;
+        }
+        
+        // Simple covariance (diagonal matrix with small values)
+        odom_msg.pose.covariance[0] = 0.01;   // x
+        odom_msg.pose.covariance[7] = 0.01;   // y
+        odom_msg.pose.covariance[35] = 0.02;  // theta
+        
+        odom_msg.twist.covariance[0] = 0.01;   // vx
+        odom_msg.twist.covariance[7] = 0.01;   // vy
+        odom_msg.twist.covariance[35] = 0.02;  // vtheta
+        
+        odom_publisher_->publish(odom_msg);
+        
+        // Update previous poses for next iteration
+        prev_robot_pose_ = robot_pose_;
+        prev_odom_pose = odom_pose_;
+        last_time = current_time;
+    }
+    
+    void publish_tf()
+    {
+        geometry_msgs::msg::TransformStamped t;
+        auto current_time = this->now();
+        
+        // Publish odom -> base_link transform
+        t.header.stamp = current_time;
+        t.header.frame_id = "odom";
+        t.child_frame_id = "base_link";
+        
+        t.transform.translation.x = odom_pose_.x;
+        t.transform.translation.y = odom_pose_.y;
+        t.transform.translation.z = 0.0;
+        
+        tf2::Quaternion q;
+        q.setRPY(0, 0, odom_pose_.theta);
+        t.transform.rotation.x = q.x();
+        t.transform.rotation.y = q.y();
+        t.transform.rotation.z = q.z();
+        t.transform.rotation.w = q.w();
+        
+        tf_broadcaster_->sendTransform(t);
+        
+        // Also publish base_link -> base_footprint transform (identity)
+        geometry_msgs::msg::TransformStamped footprint_tf;
+        footprint_tf.header.stamp = current_time;
+        footprint_tf.header.frame_id = "base_link";
+        footprint_tf.child_frame_id = "base_footprint";
+        
+        footprint_tf.transform.translation.x = 0.0;
+        footprint_tf.transform.translation.y = 0.0;
+        footprint_tf.transform.translation.z = 0.0;
+        
+        tf2::Quaternion identity_q;
+        identity_q.setRPY(0, 0, 0);
+        footprint_tf.transform.rotation.x = identity_q.x();
+        footprint_tf.transform.rotation.y = identity_q.y();
+        footprint_tf.transform.rotation.z = identity_q.z();
+        footprint_tf.transform.rotation.w = identity_q.w();
+        
+        tf_broadcaster_->sendTransform(footprint_tf);
     }
     
     void publish_whiteline_points(const std::vector<Point2f>& points)
@@ -447,11 +575,119 @@ private:
         marker.color.a = is_visible ? 1.0 : 0.3;
     }
     
+    void updateHumanoidMovement()
+    {
+        const double STATE_DURATION = 3.0;  // Each movement state lasts 3 seconds
+        const double MOVE_SPEED = 0.5;      // m/s movement speed
+        const double TURN_SPEED = 0.8;      // rad/s rotation speed
+        
+        // Check if it's time to change movement state
+        if (state_duration_ >= STATE_DURATION) {
+            movement_state_ = (movement_state_ + 1) % 8;  // 8 different movement states
+            state_duration_ = 0.0;
+            RCLCPP_INFO(this->get_logger(), "Switching to movement state: %d", movement_state_);
+        }
+        
+        double dt = 0.1;  // Time step for movement calculation
+        
+        switch (movement_state_) {
+            case 0:  // Move forward
+                robot_pose_.x += MOVE_SPEED * dt * std::cos(robot_pose_.theta);
+                robot_pose_.y += MOVE_SPEED * dt * std::sin(robot_pose_.theta);
+                break;
+            case 1:  // Move backward
+                robot_pose_.x -= MOVE_SPEED * dt * std::cos(robot_pose_.theta);
+                robot_pose_.y -= MOVE_SPEED * dt * std::sin(robot_pose_.theta);
+                break;
+            case 2:  // Move left (strafe)
+                robot_pose_.x += MOVE_SPEED * dt * std::cos(robot_pose_.theta + M_PI/2);
+                robot_pose_.y += MOVE_SPEED * dt * std::sin(robot_pose_.theta + M_PI/2);
+                break;
+            case 3:  // Move right (strafe)
+                robot_pose_.x += MOVE_SPEED * dt * std::cos(robot_pose_.theta - M_PI/2);
+                robot_pose_.y += MOVE_SPEED * dt * std::sin(robot_pose_.theta - M_PI/2);
+                break;
+            case 4:  // Rotate left
+                robot_pose_.theta += TURN_SPEED * dt;
+                if (robot_pose_.theta > M_PI) robot_pose_.theta -= 2 * M_PI;
+                break;
+            case 5:  // Rotate right
+                robot_pose_.theta -= TURN_SPEED * dt;
+                if (robot_pose_.theta < -M_PI) robot_pose_.theta += 2 * M_PI;
+                break;
+            case 6:  // Move forward-left diagonal
+                robot_pose_.x += MOVE_SPEED * dt * std::cos(robot_pose_.theta + M_PI/4);
+                robot_pose_.y += MOVE_SPEED * dt * std::sin(robot_pose_.theta + M_PI/4);
+                break;
+            case 7:  // Move forward-right diagonal
+                robot_pose_.x += MOVE_SPEED * dt * std::cos(robot_pose_.theta - M_PI/4);
+                robot_pose_.y += MOVE_SPEED * dt * std::sin(robot_pose_.theta - M_PI/4);
+                break;
+        }
+        
+        // Keep robot within field boundaries (with some margin)
+        const double FIELD_X_MAX = 6.5;  // Half field length with margin
+        const double FIELD_Y_MAX = 4.0;  // Half field width with margin
+        
+        if (robot_pose_.x > FIELD_X_MAX || robot_pose_.x < -FIELD_X_MAX ||
+            robot_pose_.y > FIELD_Y_MAX || robot_pose_.y < -FIELD_Y_MAX) {
+            // If robot goes out of bounds, turn towards center
+            double angle_to_center = std::atan2(-robot_pose_.y, -robot_pose_.x);
+            robot_pose_.theta = angle_to_center;
+        }
+    }
+    
+    void updateSlowForwardMovement()
+    {
+        const double SLOW_SPEED = 0.2;  // Very slow forward speed: 0.2 m/s
+        double dt = 0.1;  // Time step for movement calculation
+        
+        // Move forward slowly in current direction (true robot pose)
+        robot_pose_.x += SLOW_SPEED * dt * std::cos(robot_pose_.theta);
+        robot_pose_.y += SLOW_SPEED * dt * std::sin(robot_pose_.theta);
+        
+        // Update odometry with some drift/error (reduced for more realistic simulation)
+        const double ODOM_DRIFT_RATE = 0.002;  // 0.2% drift per update (reduced from 2%)
+        const double ODOM_NOISE = 0.0005;      // Small random noise (reduced)
+        
+        // Add some systematic drift and noise to odometry
+        double dx_true = SLOW_SPEED * dt * std::cos(robot_pose_.theta);
+        double dy_true = SLOW_SPEED * dt * std::sin(robot_pose_.theta);
+        
+        // Simulate odometry drift (slightly different from true movement)
+        double dx_odom = dx_true * (1.0 + ODOM_DRIFT_RATE * ((rand() % 100) / 100.0 - 0.5));
+        double dy_odom = dy_true * (1.0 + ODOM_DRIFT_RATE * ((rand() % 100) / 100.0 - 0.5));
+        
+        // Add small random noise
+        dx_odom += ODOM_NOISE * ((rand() % 100) / 100.0 - 0.5);
+        dy_odom += ODOM_NOISE * ((rand() % 100) / 100.0 - 0.5);
+        
+        odom_pose_.x += dx_odom;
+        odom_pose_.y += dy_odom;
+        odom_pose_.theta = robot_pose_.theta;  // Assume angle sensor is accurate
+        
+        // Keep robot within field boundaries (with some margin)
+        const double FIELD_X_MAX = 6.0;  // Half field length with margin
+        const double FIELD_Y_MAX = 3.5;  // Half field width with margin
+        
+        if (robot_pose_.x > FIELD_X_MAX || robot_pose_.x < -FIELD_X_MAX ||
+            robot_pose_.y > FIELD_Y_MAX || robot_pose_.y < -FIELD_Y_MAX) {
+            // If robot goes out of bounds, turn towards center
+            double angle_to_center = std::atan2(-robot_pose_.y, -robot_pose_.x);
+            robot_pose_.theta = angle_to_center;
+            odom_pose_.theta = robot_pose_.theta;  // Update odometry angle too
+        }
+    }
+    
     // ROS2 publishers
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr whiteline_publisher_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr landmarks_publisher_;
     rclcpp::Publisher<geometry_msgs::msg::Pose2D>::SharedPtr robot_pose_publisher_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_publisher_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_publisher_;
+    
+    // TF broadcaster
+    std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     
     // Timer
     rclcpp::TimerBase::SharedPtr timer_;
@@ -460,13 +696,17 @@ private:
     std::unique_ptr<Preprocessor> preprocessor_;
     std::vector<Point2f> all_whiteline_points_;
     std::vector<Landmark> all_landmarks_;
-    Pose robot_pose_;
+    Pose robot_pose_;         // True robot pose (ground truth)
+    Pose odom_pose_;          // Odometry estimate with accumulated error
     
     // Simulation parameters
     double fov_;
     double max_distance_;
     double robot_speed_;
     double time_step_;
+    int movement_state_;      // Current movement state (0-7)
+    double state_duration_;   // How long in current state
+    Pose prev_robot_pose_;    // Previous pose for odometry calculation
 };
 
 int main(int argc, char * argv[])

@@ -11,6 +11,9 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(visualization_msgs REQUIRED)
 
 # Include directories
@@ -23,7 +26,7 @@ ament_target_dependencies(preprocessor rclcpp)
 # Add executable for whiteline simulator node
 add_executable(whiteline_simulator_node src/whiteline_simulator_node.cpp)
 target_link_libraries(whiteline_simulator_node preprocessor)
-ament_target_dependencies(whiteline_simulator_node rclcpp std_msgs geometry_msgs visualization_msgs)
+ament_target_dependencies(whiteline_simulator_node rclcpp std_msgs geometry_msgs nav_msgs tf2 tf2_ros visualization_msgs)
 
 # Add executable for whiteline listener node
 add_executable(whiteline_listener src/whiteline_listener.cpp)
