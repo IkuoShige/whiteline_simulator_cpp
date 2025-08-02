@@ -16,13 +16,13 @@ struct Point2f {
     Point2f(float x_, float y_) : x(x_), y(y_) {}
 };
 
-// Landmark types
+// Landmark types (Reference: robocup_demo_shige/src/brain/include/locator.h)
 enum class LandmarkType {
-    T_JUNCTION = 0,      // T字型交点
-    L_CORNER = 1,        // L字型交点（コーナー）
-    X_CROSS = 2,         // X字型交点（十字）
-    PENALTY_MARK = 3,    // ペナルティマーク
-    GOAL_POST = 4        // ゴールポスト
+    T_JUNCTION = 0,      // T字型交点 (T)
+    L_CORNER = 1,        // L字型交点（コーナー） (L)
+    X_CROSS = 2,         // X字型交点（十字） (X)
+    PENALTY_MARK = 3,    // ペナルティマーク (P)
+    GOAL_POST = 4        // ゴールポスト (追加)
 };
 
 // Landmark structure
@@ -38,17 +38,31 @@ struct Landmark {
 
 // Soccer field dimensions structure
 struct SoccerFieldDimensions {
-    double field_length = 14.0;      // A: Field length
-    double field_width = 9.0;        // B: Field width
+    double field_length = 14.0;      // A: Field length (AdultSize)
+    double field_width = 9.0;        // B: Field width (AdultSize)
     double goal_depth = 0.6;         // C: Goal depth
     double goal_width = 2.6;         // D: Goal width
     double goal_area_length = 1.0;   // E: Goal area length
     double goal_area_width = 4.0;    // F: Goal area width
-    double penalty_mark_distance = 2.1;  // G: Penalty mark distance
-    double centre_circle_diameter = 3.0;  // H: Centre circle diameter
+    double penalty_mark_distance = 2.1;  // G: Penalty mark distance (penaltyDist)
+    double centre_circle_diameter = 3.0;  // H: Centre circle diameter (circleRadius * 2)
     double border_strip_width = 1.0;     // I: Border strip width (minimum)
-    double penalty_area_length = 3.0;    // J: Penalty area length
-    double penalty_area_width = 6.0;     // K: Penalty area width
+    double penalty_area_length = 3.0;    // J: Penalty area length (penaltyAreaLength)
+    double penalty_area_width = 6.0;     // K: Penalty area width (penaltyAreaWidth)
+    
+    // Reference: robocup_demo_shige/src/brain/include/types.h
+    // const FieldDimensions FD_ADULTSIZE{14, 9, 2.1, 2.6, 1.5, 3, 6, 1, 4};
+};
+
+// Camera simulation parameters
+struct CameraSimulationParams {
+    double white_line_width = 0.05;      // White line width (5cm)
+    double pixel_density = 0.01;         // Pixel density in meters (1cm per pixel)
+    double noise_std = 0.005;            // Noise standard deviation (5mm)
+    double detection_probability = 0.8;   // Probability of detecting a white line pixel
+    double min_contrast_threshold = 0.3; // Minimum contrast threshold for detection
+    double max_distance = 8.0;           // Maximum detection distance
+    double fov = M_PI / 2;              // Field of view (90 degrees)
 };
 
 class Preprocessor {
@@ -101,10 +115,36 @@ public:
      * @return Vector of visible white line points
      */
     std::vector<Point2f> simulate_white_line(
-        const std::vector<Point2f>& wlpos, 
-        const Pose& robot_pose, 
+        const std::vector<Point2f>& wlpos,
+        const Pose& robot_pose,
         double fov, 
         double max_distance
+    );
+
+    /**
+     * Simulate realistic camera-based white line detection
+     * @param wlpos All white line points in the world
+     * @param robot_pose Current robot pose
+     * @param camera_params Camera simulation parameters
+     * @return Vector of detected white line points with noise
+     */
+    std::vector<Point2f> simulate_camera_white_line_detection(
+        const std::vector<Point2f>& wlpos,
+        const Pose& robot_pose,
+        const CameraSimulationParams& camera_params
+    );
+
+    /**
+     * Generate white line area points (considering line width)
+     * @param dimensions Soccer field dimensions
+     * @param line_width Width of white lines in meters
+     * @param point_density Density of points per square meter
+     * @return Vector of white line area points
+     */
+    std::vector<Point2f> generate_white_line_areas(
+        const SoccerFieldDimensions& dimensions,
+        double line_width = 0.05,
+        double point_density = 100.0  // 100 points per square meter
     );
 
     /**
@@ -128,34 +168,18 @@ public:
      * @return String representation of landmark type
      */
     std::string get_landmark_type_name(LandmarkType type) const;
-
+    
 private:
-    /**
-     * Generate points along a line segment
-     * @param start Start point
-     * @param end End point
-     * @param spacing Point spacing
-     * @return Vector of points along the line
-     */
+    // Helper functions for realistic white line generation
+    std::vector<Point2f> generate_line_area_points(
+        const Point2f& start, const Point2f& end, double width, double points_per_meter);
+    std::vector<Point2f> generate_circle_area_points(
+        const Point2f& center, double radius, double width, double points_per_meter);
+    std::vector<Point2f> generate_rectangle_area_points(
+        const Point2f& center, double width, double height, double line_width, double points_per_meter);
+    
     std::vector<Point2f> generate_line_points(const Point2f& start, const Point2f& end, double spacing);
-    
-    /**
-     * Generate points along a circle
-     * @param center Center point
-     * @param radius Circle radius
-     * @param spacing Point spacing (angular)
-     * @return Vector of points along the circle
-     */
     std::vector<Point2f> generate_circle_points(const Point2f& center, double radius, double spacing);
-    
-    /**
-     * Generate points for a rectangular area
-     * @param center Center point
-     * @param width Rectangle width
-     * @param height Rectangle height
-     * @param spacing Point spacing
-     * @return Vector of points forming the rectangle
-     */
     std::vector<Point2f> generate_rectangle_points(const Point2f& center, double width, double height, double spacing);
 };
 

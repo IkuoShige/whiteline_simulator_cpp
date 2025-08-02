@@ -8,6 +8,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/float32_multi_array.hpp"
 #include "geometry_msgs/msg/pose2_d.hpp"
+#include "geometry_msgs/msg/twist.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2/LinearMath/Quaternion.h"
@@ -25,12 +26,15 @@ public:
     WhitelineSimulatorNode()
     : Node("whiteline_simulator_node"), 
       preprocessor_(std::make_unique<Preprocessor>()),
-      robot_pose_(-5.5, -1.8, 0.0),  // Start at touchline-penalty area intersection facing field center
-      odom_pose_(-5.5, -1.8, 0.0),   // Initialize odometry to same position
+      robot_pose_(-4.0, -5.0, 1.5708),  // Start at field coordinate (-4.0, -5.0) facing north (π/2)
+      odom_pose_(-4.0, -5.0, 1.5708),   // Initialize odometry to same position
       time_step_(0.0),
       movement_state_(0),
       state_duration_(0.0),
-      prev_robot_pose_(-5.5, -1.8, 0.0)
+      prev_robot_pose_(-4.0, -5.0, 1.5708),
+      cmd_vel_linear_(0.0),
+      cmd_vel_angular_(0.0),
+      current_timestamp_(this->now())
     {
         // Declare parameters
         this->declare_parameter<std::string>("whiteline_points_file", "soccer_field_points.txt");
@@ -42,6 +46,15 @@ public:
         this->declare_parameter<double>("robot_speed", 0.1);  // Robot movement speed
         this->declare_parameter<double>("field_length", 14.0);
         this->declare_parameter<double>("field_width", 9.0);
+        this->declare_parameter<bool>("keyboard_control", false);
+        
+        // Camera simulation parameters
+        this->declare_parameter<double>("white_line_width", 0.05);      // White line width (5cm)
+        this->declare_parameter<double>("pixel_density", 0.01);         // Pixel density in meters (1cm per pixel)
+        this->declare_parameter<double>("noise_std", 0.005);            // Noise standard deviation (5mm)
+        this->declare_parameter<double>("detection_probability", 0.8);   // Probability of detecting a white line pixel
+        this->declare_parameter<double>("min_contrast_threshold", 0.3); // Minimum contrast threshold for detection
+        this->declare_parameter<bool>("use_realistic_simulation", true); // Use realistic camera simulation
         
         // Publishers
         whiteline_publisher_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
@@ -55,6 +68,11 @@ public:
         marker_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
             "whiteline_markers", 10);
             
+        // Twist subscriber for keyboard control
+        cmd_vel_subscriber_ = this->create_subscription<geometry_msgs::msg::Twist>(
+            "cmd_vel", 10, 
+            std::bind(&WhitelineSimulatorNode::cmd_vel_callback, this, std::placeholders::_1));
+            
         // TF broadcaster
         tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
         
@@ -66,6 +84,17 @@ public:
         fov_ = this->get_parameter("fov").as_double();
         max_distance_ = this->get_parameter("max_distance").as_double();
         robot_speed_ = this->get_parameter("robot_speed").as_double();
+        keyboard_control_ = this->get_parameter("keyboard_control").as_bool();
+        
+        // Get camera simulation parameters
+        camera_params_.white_line_width = this->get_parameter("white_line_width").as_double();
+        camera_params_.pixel_density = this->get_parameter("pixel_density").as_double();
+        camera_params_.noise_std = this->get_parameter("noise_std").as_double();
+        camera_params_.detection_probability = this->get_parameter("detection_probability").as_double();
+        camera_params_.min_contrast_threshold = this->get_parameter("min_contrast_threshold").as_double();
+        camera_params_.max_distance = max_distance_;
+        camera_params_.fov = fov_;
+        use_realistic_simulation_ = this->get_parameter("use_realistic_simulation").as_bool();
         
         // Load or generate white line points and landmarks
         if (generate_soccer_field) {
@@ -77,7 +106,17 @@ public:
             dimensions.field_width = this->get_parameter("field_width").as_double();
             
             // Generate soccer field lines and landmarks
-            all_whiteline_points_ = preprocessor_->generate_soccer_field_lines(dimensions, point_spacing);
+            if (use_realistic_simulation_) {
+                // Use realistic white line areas with width
+                all_whiteline_points_ = preprocessor_->generate_white_line_areas(
+                    dimensions, camera_params_.white_line_width, 1000.0);  // 1000 points per square meter for better coverage
+                RCLCPP_INFO(this->get_logger(), "Generated realistic white line areas with width %.3fm", camera_params_.white_line_width);
+            } else {
+                // Use original line-based generation
+                all_whiteline_points_ = preprocessor_->generate_soccer_field_lines(dimensions, point_spacing);
+                RCLCPP_INFO(this->get_logger(), "Generated line-based white line points");
+            }
+            
             all_landmarks_ = preprocessor_->generate_soccer_field_landmarks(dimensions);
             
             // Save to files for future use
@@ -108,25 +147,55 @@ public:
         RCLCPP_INFO(this->get_logger(), "Loaded %zu landmarks", all_landmarks_.size());
         RCLCPP_INFO(this->get_logger(), "FOV: %.2f rad (%.1f deg), Max distance: %.2f m", 
                     fov_, fov_ * 180.0 / M_PI, max_distance_);
+        RCLCPP_INFO(this->get_logger(), "Keyboard control: %s", keyboard_control_ ? "enabled" : "disabled");
+        if (keyboard_control_) {
+            RCLCPP_INFO(this->get_logger(), "Listening for cmd_vel messages for keyboard control");
+        }
     }
 
 private:
+    void cmd_vel_callback(const geometry_msgs::msg::Twist::SharedPtr msg)
+    {
+        cmd_vel_linear_ = msg->linear.x;
+        cmd_vel_angular_ = msg->angular.z;
+    }
+    
     void timer_callback()
     {
-        // Slow forward movement for particle tracking experiment
-        updateSlowForwardMovement();
+        // Update robot movement based on control mode
+        if (keyboard_control_) {
+            updateKeyboardMovement();
+        } else {
+            // Slow forward movement for particle tracking experiment
+            updateSlowForwardMovement();
+        }
         
         // Increment time step for logging
         time_step_ += 0.1;
         
-        // Publish current robot pose and odometry
+        // Get current time once for all messages to ensure synchronization
+        current_timestamp_ = this->now();
+        
+        // Publish TF transforms first, then odometry to avoid timing issues
+        publish_tf();
         publish_robot_pose();
         publish_odometry();
-        publish_tf();
         
-        // Simulate white line detection
-        std::vector<Point2f> visible_points = preprocessor_->simulate_white_line(
-            all_whiteline_points_, robot_pose_, fov_, max_distance_);
+        // Simulate white line detection from robot's perspective
+        std::vector<Point2f> visible_points;
+        if (use_realistic_simulation_) {
+            // Use realistic camera-based detection with noise and detection probability
+            visible_points = preprocessor_->simulate_camera_white_line_detection(
+                all_whiteline_points_, robot_pose_, camera_params_);
+            RCLCPP_INFO(this->get_logger(), "Robot at (%.2f, %.2f, %.2f), Realistic camera detected %zu white line points", 
+                        robot_pose_.x, robot_pose_.y, robot_pose_.theta, visible_points.size());
+        } else {
+            // Use original simple detection
+            visible_points = preprocessor_->simulate_white_line(
+                all_whiteline_points_, robot_pose_, fov_, max_distance_);
+            RCLCPP_INFO(this->get_logger(), "Robot at (%.2f, %.2f, %.2f), Simple detection found %zu white line points", 
+                        robot_pose_.x, robot_pose_.y, robot_pose_.theta, visible_points.size());
+        }
         
         // Simulate landmark detection
         std::vector<Landmark> visible_landmarks = preprocessor_->simulate_landmarks(
@@ -171,7 +240,8 @@ private:
     void publish_odometry()
     {
         auto odom_msg = nav_msgs::msg::Odometry();
-        auto current_time = this->now();
+        // Use synchronized timestamp
+        auto current_time = current_timestamp_;
         
         // Header
         odom_msg.header.stamp = current_time;
@@ -190,26 +260,44 @@ private:
         odom_msg.pose.pose.orientation.z = std::sin(half_theta);
         odom_msg.pose.pose.orientation.w = std::cos(half_theta);
         
-        // Calculate velocity (simple difference using odometry)
-        static auto last_time = current_time;
-        static Pose prev_odom_pose = odom_pose_;
-        double dt = (current_time - last_time).seconds();
-        if (dt > 0.0) {
-            double dx = odom_pose_.x - prev_odom_pose.x;
-            double dy = odom_pose_.y - prev_odom_pose.y;
-            double dtheta = odom_pose_.theta - prev_odom_pose.theta;
-            
-            // Normalize angle difference
-            while (dtheta > M_PI) dtheta -= 2 * M_PI;
-            while (dtheta < -M_PI) dtheta += 2 * M_PI;
-            
-            odom_msg.twist.twist.linear.x = dx / dt;
-            odom_msg.twist.twist.linear.y = dy / dt;
-            odom_msg.twist.twist.angular.z = dtheta / dt;
+        // Set velocity based on control mode
+        if (keyboard_control_) {
+            // For keyboard control, use the commanded velocities directly
+            odom_msg.twist.twist.linear.x = cmd_vel_linear_;
+            odom_msg.twist.twist.linear.y = 0.0;  // No lateral movement for differential drive
+            odom_msg.twist.twist.angular.z = cmd_vel_angular_;
         } else {
-            odom_msg.twist.twist.linear.x = 0.0;
-            odom_msg.twist.twist.linear.y = 0.0;
-            odom_msg.twist.twist.angular.z = 0.0;
+            // For automatic movement, calculate velocity from position difference
+            static auto last_time = current_time;
+            static Pose prev_odom_pose = odom_pose_;
+            double dt = (current_time - last_time).seconds();
+            if (dt > 0.0) {
+                double dx = odom_pose_.x - prev_odom_pose.x;
+                double dy = odom_pose_.y - prev_odom_pose.y;
+                double dtheta = odom_pose_.theta - prev_odom_pose.theta;
+                
+                // Normalize angle difference
+                while (dtheta > M_PI) dtheta -= 2 * M_PI;
+                while (dtheta < -M_PI) dtheta += 2 * M_PI;
+                
+                // Convert global velocity to local velocity (robot frame)
+                double v_global_x = dx / dt;
+                double v_global_y = dy / dt;
+                
+                // Transform to robot's local frame using odometry angle
+                double cos_theta = std::cos(odom_pose_.theta);
+                double sin_theta = std::sin(odom_pose_.theta);
+                
+                odom_msg.twist.twist.linear.x = v_global_x * cos_theta + v_global_y * sin_theta;
+                odom_msg.twist.twist.linear.y = -v_global_x * sin_theta + v_global_y * cos_theta;
+                odom_msg.twist.twist.angular.z = dtheta / dt;
+            } else {
+                odom_msg.twist.twist.linear.x = 0.0;
+                odom_msg.twist.twist.linear.y = 0.0;
+                odom_msg.twist.twist.angular.z = 0.0;
+            }
+            prev_odom_pose = odom_pose_;
+            last_time = current_time;
         }
         
         // Simple covariance (diagonal matrix with small values)
@@ -225,32 +313,47 @@ private:
         
         // Update previous poses for next iteration
         prev_robot_pose_ = robot_pose_;
-        prev_odom_pose = odom_pose_;
-        last_time = current_time;
     }
     
     void publish_tf()
     {
-        geometry_msgs::msg::TransformStamped t;
-        auto current_time = this->now();
+        // Use synchronized timestamp
+        auto current_time = current_timestamp_;
+        std::vector<geometry_msgs::msg::TransformStamped> transforms;
+        
+        // Publish map -> odom transform (identity, since we don't have SLAM)
+        geometry_msgs::msg::TransformStamped map_to_odom;
+        map_to_odom.header.stamp = current_time;
+        map_to_odom.header.frame_id = "map";
+        map_to_odom.child_frame_id = "odom";
+        map_to_odom.transform.translation.x = 0.0;
+        map_to_odom.transform.translation.y = 0.0;
+        map_to_odom.transform.translation.z = 0.0;
+        tf2::Quaternion map_q;
+        map_q.setRPY(0, 0, 0);
+        map_to_odom.transform.rotation.x = map_q.x();
+        map_to_odom.transform.rotation.y = map_q.y();
+        map_to_odom.transform.rotation.z = map_q.z();
+        map_to_odom.transform.rotation.w = map_q.w();
+        transforms.push_back(map_to_odom);
         
         // Publish odom -> base_link transform
-        t.header.stamp = current_time;
-        t.header.frame_id = "odom";
-        t.child_frame_id = "base_link";
+        geometry_msgs::msg::TransformStamped odom_to_base;
+        odom_to_base.header.stamp = current_time;
+        odom_to_base.header.frame_id = "odom";
+        odom_to_base.child_frame_id = "base_link";
         
-        t.transform.translation.x = odom_pose_.x;
-        t.transform.translation.y = odom_pose_.y;
-        t.transform.translation.z = 0.0;
+        odom_to_base.transform.translation.x = odom_pose_.x;
+        odom_to_base.transform.translation.y = odom_pose_.y;
+        odom_to_base.transform.translation.z = 0.0;
         
         tf2::Quaternion q;
         q.setRPY(0, 0, odom_pose_.theta);
-        t.transform.rotation.x = q.x();
-        t.transform.rotation.y = q.y();
-        t.transform.rotation.z = q.z();
-        t.transform.rotation.w = q.w();
-        
-        tf_broadcaster_->sendTransform(t);
+        odom_to_base.transform.rotation.x = q.x();
+        odom_to_base.transform.rotation.y = q.y();
+        odom_to_base.transform.rotation.z = q.z();
+        odom_to_base.transform.rotation.w = q.w();
+        transforms.push_back(odom_to_base);
         
         // Also publish base_link -> base_footprint transform (identity)
         geometry_msgs::msg::TransformStamped footprint_tf;
@@ -268,8 +371,10 @@ private:
         footprint_tf.transform.rotation.y = identity_q.y();
         footprint_tf.transform.rotation.z = identity_q.z();
         footprint_tf.transform.rotation.w = identity_q.w();
+        transforms.push_back(footprint_tf);
         
-        tf_broadcaster_->sendTransform(footprint_tf);
+        // Send all transforms together to ensure consistency
+        tf_broadcaster_->sendTransform(transforms);
     }
     
     void publish_whiteline_points(const std::vector<Point2f>& points)
@@ -365,31 +470,94 @@ private:
             all_points_marker.points.push_back(p);
         }
         
-        // Create marker for visible white line points (white)
-        visualization_msgs::msg::Marker visible_points_marker;
-        visible_points_marker.header.frame_id = "map";
-        visible_points_marker.header.stamp = this->get_clock()->now();
-        visible_points_marker.ns = "visible_whiteline_points";
-        visible_points_marker.id = 1;
-        visible_points_marker.type = visualization_msgs::msg::Marker::POINTS;
-        visible_points_marker.action = visualization_msgs::msg::Marker::ADD;
+        // Create marker for visible white line points in robot frame (blue)
+        visualization_msgs::msg::Marker visible_points_robot_marker;
+        visible_points_robot_marker.header.frame_id = "base_link";
+        visible_points_robot_marker.header.stamp = this->get_clock()->now();
+        visible_points_robot_marker.ns = "visible_whiteline_points_robot";
+        visible_points_robot_marker.id = 1;
+        visible_points_robot_marker.type = visualization_msgs::msg::Marker::POINTS;
+        visible_points_robot_marker.action = visualization_msgs::msg::Marker::ADD;
         
-        // Set marker properties for visible points (white)
-        visible_points_marker.pose.orientation.w = 1.0;
-        visible_points_marker.scale.x = 0.08;  // Larger point width
-        visible_points_marker.scale.y = 0.08;  // Larger point height
-        visible_points_marker.color.r = 1.0;  // White color
-        visible_points_marker.color.g = 1.0;  // White color  
-        visible_points_marker.color.b = 1.0;  // White color
-        visible_points_marker.color.a = 1.0;  // Fully opaque
+        // Set marker properties for robot frame points (blue)
+        visible_points_robot_marker.pose.orientation.w = 1.0;
+        visible_points_robot_marker.scale.x = 0.08;  // Larger point width
+        visible_points_robot_marker.scale.y = 0.08;  // Larger point height
+        visible_points_robot_marker.color.r = 0.0;  // Blue color
+        visible_points_robot_marker.color.g = 0.0;  // Blue color  
+        visible_points_robot_marker.color.b = 1.0;  // Blue color
+        visible_points_robot_marker.color.a = 1.0;  // Fully opaque
         
-        // Add visible points to marker
+        // Add visible points in robot frame
         for (const auto& point : visible_points) {
             geometry_msgs::msg::Point p;
             p.x = point.x;
             p.y = point.y;
             p.z = 0.0;
-            visible_points_marker.points.push_back(p);
+            visible_points_robot_marker.points.push_back(p);
+        }
+        
+        // Create marker for visible white line points transformed to global frame (white)
+        visualization_msgs::msg::Marker visible_points_global_marker;
+        visible_points_global_marker.header.frame_id = "map";
+        visible_points_global_marker.header.stamp = this->get_clock()->now();
+        visible_points_global_marker.ns = "visible_whiteline_points_global";
+        visible_points_global_marker.id = 2;
+        visible_points_global_marker.type = visualization_msgs::msg::Marker::POINTS;
+        visible_points_global_marker.action = visualization_msgs::msg::Marker::ADD;
+        
+        // Set marker properties for global frame points (white)
+        visible_points_global_marker.pose.orientation.w = 1.0;
+        visible_points_global_marker.scale.x = 0.10;  // Slightly larger point width
+        visible_points_global_marker.scale.y = 0.10;  // Slightly larger point height
+        visible_points_global_marker.color.r = 1.0;  // White color
+        visible_points_global_marker.color.g = 1.0;  // White color  
+        visible_points_global_marker.color.b = 1.0;  // White color
+        visible_points_global_marker.color.a = 1.0;  // Fully opaque
+        
+        // Transform robot frame points back to global frame for visualization
+        // Forward transformation: R * p_local + p_robot (ROS convention)
+        double cos_theta = std::cos(robot_pose_.theta);
+        double sin_theta = std::sin(robot_pose_.theta);
+        for (const auto& local_point : visible_points) {
+            geometry_msgs::msg::Point p;
+            p.x = robot_pose_.x + local_point.x * cos_theta - local_point.y * sin_theta;
+            p.y = robot_pose_.y + local_point.x * sin_theta + local_point.y * cos_theta;
+            p.z = 0.0;
+            visible_points_global_marker.points.push_back(p);
+        }
+        
+        // Create marker for sample debug points (red) - first 5 visible points transformed to global
+        if (!visible_points.empty()) {
+            visualization_msgs::msg::Marker sample_points_marker;
+            sample_points_marker.header.frame_id = "map";
+            sample_points_marker.header.stamp = this->get_clock()->now();
+            sample_points_marker.ns = "sample_debug_points";
+            sample_points_marker.id = 10;  // Changed ID to avoid conflicts
+            sample_points_marker.type = visualization_msgs::msg::Marker::POINTS;
+            sample_points_marker.action = visualization_msgs::msg::Marker::ADD;
+            
+            // Set marker properties for sample points (red)
+            sample_points_marker.pose.orientation.w = 1.0;
+            sample_points_marker.scale.x = 0.15;  // Larger point width for visibility
+            sample_points_marker.scale.y = 0.15;  // Larger point height for visibility
+            sample_points_marker.color.r = 1.0;  // Red color
+            sample_points_marker.color.g = 0.0;  // Red color
+            sample_points_marker.color.b = 0.0;  // Red color
+            sample_points_marker.color.a = 1.0;  // Fully opaque
+            
+            // Transform first 5 visible points from robot frame to global frame
+            int num_sample_points = std::min(5, static_cast<int>(visible_points.size()));
+            for (int i = 0; i < num_sample_points; ++i) {
+                geometry_msgs::msg::Point p;
+                // Transform robot-local point to global coordinates
+                p.x = robot_pose_.x + visible_points[i].x * cos_theta - visible_points[i].y * sin_theta;
+                p.y = robot_pose_.y + visible_points[i].x * sin_theta + visible_points[i].y * cos_theta;
+                p.z = 0.1;  // Slightly elevated for visibility
+                sample_points_marker.points.push_back(p);
+            }
+            
+            marker_array.markers.push_back(sample_points_marker);
         }
         
         // Create markers for all landmarks
@@ -420,30 +588,62 @@ private:
             marker_array.markers.push_back(landmark_marker);
         }
         
-        // Create markers for visible landmarks
+        // Create markers for visible landmarks in robot frame
         for (size_t i = 0; i < visible_landmarks.size(); ++i) {
             visualization_msgs::msg::Marker landmark_marker;
-            landmark_marker.header.frame_id = "map";
+            landmark_marker.header.frame_id = "base_link";
             landmark_marker.header.stamp = this->get_clock()->now();
-            landmark_marker.ns = "visible_landmarks";
+            landmark_marker.ns = "visible_landmarks_robot";
             landmark_marker.id = i + 200;  // Offset to avoid ID conflicts
             landmark_marker.type = visualization_msgs::msg::Marker::CUBE;
             landmark_marker.action = visualization_msgs::msg::Marker::ADD;
             
-            // Set position
+            // Set position in robot frame
             landmark_marker.pose.position.x = visible_landmarks[i].position.x;
             landmark_marker.pose.position.y = visible_landmarks[i].position.y;
             landmark_marker.pose.position.z = 0.2;
             
-            // Set orientation
+            // Set orientation in robot frame
             double half_theta = visible_landmarks[i].orientation / 2.0;
             landmark_marker.pose.orientation.x = 0.0;
             landmark_marker.pose.orientation.y = 0.0;
             landmark_marker.pose.orientation.z = std::sin(half_theta);
             landmark_marker.pose.orientation.w = std::cos(half_theta);
             
-            // Set size and color based on landmark type
-            set_landmark_marker_properties(landmark_marker, visible_landmarks[i].type, true);
+            // Set size and color based on landmark type (darker for robot frame)
+            set_landmark_marker_properties(landmark_marker, visible_landmarks[i].type, false);  // Use darker colors
+            
+            marker_array.markers.push_back(landmark_marker);
+        }
+        
+        // Create markers for visible landmarks transformed to global frame
+        for (size_t i = 0; i < visible_landmarks.size(); ++i) {
+            visualization_msgs::msg::Marker landmark_marker;
+            landmark_marker.header.frame_id = "map";
+            landmark_marker.header.stamp = this->get_clock()->now();
+            landmark_marker.ns = "visible_landmarks_global";
+            landmark_marker.id = i + 300;  // Offset to avoid ID conflicts
+            landmark_marker.type = visualization_msgs::msg::Marker::CUBE;
+            landmark_marker.action = visualization_msgs::msg::Marker::ADD;
+            
+            // Transform position to global frame (ROS convention)
+            // Forward transformation: R * p_local + p_robot
+            double cos_theta = std::cos(robot_pose_.theta);
+            double sin_theta = std::sin(robot_pose_.theta);
+            landmark_marker.pose.position.x = robot_pose_.x + visible_landmarks[i].position.x * cos_theta - visible_landmarks[i].position.y * sin_theta;
+            landmark_marker.pose.position.y = robot_pose_.y + visible_landmarks[i].position.x * sin_theta + visible_landmarks[i].position.y * cos_theta;
+            landmark_marker.pose.position.z = 0.25;  // Slightly higher for visibility
+            
+            // Transform orientation to global frame
+            double global_orientation = visible_landmarks[i].orientation + robot_pose_.theta;
+            double half_theta = global_orientation / 2.0;
+            landmark_marker.pose.orientation.x = 0.0;
+            landmark_marker.pose.orientation.y = 0.0;
+            landmark_marker.pose.orientation.z = std::sin(half_theta);
+            landmark_marker.pose.orientation.w = std::cos(half_theta);
+            
+            // Set size and color based on landmark type (bright for global frame)
+            set_landmark_marker_properties(landmark_marker, visible_landmarks[i].type, true);  // Use bright colors
             
             marker_array.markers.push_back(landmark_marker);
         }
@@ -519,7 +719,8 @@ private:
         
         // Add markers to array
         marker_array.markers.push_back(all_points_marker);
-        marker_array.markers.push_back(visible_points_marker);
+        marker_array.markers.push_back(visible_points_robot_marker);      // Robot frame white line points (blue)
+        marker_array.markers.push_back(visible_points_global_marker);     // Global frame white line points (white)  
         marker_array.markers.push_back(robot_marker);
         marker_array.markers.push_back(fov_marker);
         
@@ -625,9 +826,9 @@ private:
                 break;
         }
         
-        // Keep robot within field boundaries (with some margin)
-        const double FIELD_X_MAX = 6.5;  // Half field length with margin
-        const double FIELD_Y_MAX = 4.0;  // Half field width with margin
+        // Keep robot within extended boundaries to allow operation outside field
+        const double FIELD_X_MAX = 9.0;  // Extended margin beyond field boundaries
+        const double FIELD_Y_MAX = 6.5;  // Extended margin beyond field boundaries
         
         if (robot_pose_.x > FIELD_X_MAX || robot_pose_.x < -FIELD_X_MAX ||
             robot_pose_.y > FIELD_Y_MAX || robot_pose_.y < -FIELD_Y_MAX) {
@@ -635,6 +836,62 @@ private:
             double angle_to_center = std::atan2(-robot_pose_.y, -robot_pose_.x);
             robot_pose_.theta = angle_to_center;
         }
+    }
+    
+    void updateKeyboardMovement()
+    {
+        double dt = 0.1;  // Time step for movement calculation
+        
+        // Update robot orientation first
+        double dtheta_true = cmd_vel_angular_ * dt;
+        robot_pose_.theta += dtheta_true;
+        
+        // Normalize angle to [-pi, pi]
+        while (robot_pose_.theta > M_PI) robot_pose_.theta -= 2 * M_PI;
+        while (robot_pose_.theta < -M_PI) robot_pose_.theta += 2 * M_PI;
+        
+        // Update robot position based on linear velocity in robot's local frame
+        double dx_true = cmd_vel_linear_ * dt * std::cos(robot_pose_.theta);
+        double dy_true = cmd_vel_linear_ * dt * std::sin(robot_pose_.theta);
+        
+        robot_pose_.x += dx_true;
+        robot_pose_.y += dy_true;
+        
+        // Update odometry with some drift/error
+        const double ODOM_DRIFT_RATE = 0.002;  // 0.2% drift per update
+        const double ODOM_NOISE = 0.0005;      // Small random noise
+        
+        // Simulate odometry drift for angular velocity
+        double dtheta_odom = dtheta_true * (1.0 + ODOM_DRIFT_RATE * ((rand() % 100) / 100.0 - 0.5));
+        odom_pose_.theta += dtheta_odom;
+        
+        // Normalize odometry angle
+        while (odom_pose_.theta > M_PI) odom_pose_.theta -= 2 * M_PI;
+        while (odom_pose_.theta < -M_PI) odom_pose_.theta += 2 * M_PI;
+        
+        // Calculate odometry position update using odometry's angle (not true angle)
+        // This simulates the fact that odometry uses its own angle estimate
+        double dx_odom = cmd_vel_linear_ * dt * std::cos(odom_pose_.theta);
+        double dy_odom = cmd_vel_linear_ * dt * std::sin(odom_pose_.theta);
+        
+        // Add drift and noise to position
+        dx_odom *= (1.0 + ODOM_DRIFT_RATE * ((rand() % 100) / 100.0 - 0.5));
+        dy_odom *= (1.0 + ODOM_DRIFT_RATE * ((rand() % 100) / 100.0 - 0.5));
+        dx_odom += ODOM_NOISE * ((rand() % 100) / 100.0 - 0.5);
+        dy_odom += ODOM_NOISE * ((rand() % 100) / 100.0 - 0.5);
+        
+        odom_pose_.x += dx_odom;
+        odom_pose_.y += dy_odom;
+        
+        // Keep robot within extended boundaries to allow operation outside field
+        const double FIELD_X_MAX = 9.0;  // Extended margin beyond field boundaries
+        const double FIELD_Y_MAX = 6.5;  // Extended margin beyond field boundaries
+        
+        // Clamp position to extended boundaries
+        if (robot_pose_.x > FIELD_X_MAX) robot_pose_.x = FIELD_X_MAX;
+        if (robot_pose_.x < -FIELD_X_MAX) robot_pose_.x = -FIELD_X_MAX;
+        if (robot_pose_.y > FIELD_Y_MAX) robot_pose_.y = FIELD_Y_MAX;
+        if (robot_pose_.y < -FIELD_Y_MAX) robot_pose_.y = -FIELD_Y_MAX;
     }
     
     void updateSlowForwardMovement()
@@ -666,9 +923,9 @@ private:
         odom_pose_.y += dy_odom;
         odom_pose_.theta = robot_pose_.theta;  // Assume angle sensor is accurate
         
-        // Keep robot within field boundaries (with some margin)
-        const double FIELD_X_MAX = 6.0;  // Half field length with margin
-        const double FIELD_Y_MAX = 3.5;  // Half field width with margin
+        // Keep robot within extended boundaries to allow operation outside field
+        const double FIELD_X_MAX = 9.0;  // Extended margin beyond field boundaries
+        const double FIELD_Y_MAX = 6.5;  // Extended margin beyond field boundaries
         
         if (robot_pose_.x > FIELD_X_MAX || robot_pose_.x < -FIELD_X_MAX ||
             robot_pose_.y > FIELD_Y_MAX || robot_pose_.y < -FIELD_Y_MAX) {
@@ -686,6 +943,9 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_publisher_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_publisher_;
     
+    // ROS2 subscriber
+    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_subscriber_;
+    
     // TF broadcaster
     std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     
@@ -696,10 +956,11 @@ private:
     std::unique_ptr<Preprocessor> preprocessor_;
     std::vector<Point2f> all_whiteline_points_;
     std::vector<Landmark> all_landmarks_;
+    // 状態管理
     Pose robot_pose_;         // True robot pose (ground truth)
     Pose odom_pose_;          // Odometry estimate with accumulated error
     
-    // Simulation parameters
+    // パラメータ
     double fov_;
     double max_distance_;
     double robot_speed_;
@@ -707,6 +968,17 @@ private:
     int movement_state_;      // Current movement state (0-7)
     double state_duration_;   // How long in current state
     Pose prev_robot_pose_;    // Previous pose for odometry calculation
+    
+    // カメラシミュレーションパラメータ
+    CameraSimulationParams camera_params_;
+    bool use_realistic_simulation_;
+    
+    bool keyboard_control_;   // Whether keyboard control is enabled
+    double cmd_vel_linear_;   // Commanded linear velocity from keyboard
+    double cmd_vel_angular_;  // Commanded angular velocity from keyboard
+    
+    // タイムスタンプ
+    rclcpp::Time current_timestamp_;
 };
 
 int main(int argc, char * argv[])
