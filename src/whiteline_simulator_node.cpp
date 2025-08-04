@@ -15,6 +15,7 @@
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
+#include "booster_interface/msg/odometer.hpp"
 #include "whiteline_simulator_cpp/preprocessor.hpp"
 #include "whiteline_simulator_cpp/pose.hpp"
 
@@ -56,6 +57,10 @@ public:
         this->declare_parameter<double>("min_contrast_threshold", 0.3); // Minimum contrast threshold for detection
         this->declare_parameter<bool>("use_realistic_simulation", true); // Use realistic camera simulation
         
+        // Real robot compatibility parameters
+        this->declare_parameter<double>("robot.odom_factor", 1.0);  // Robot odometry correction factor
+        this->declare_parameter<bool>("publish_odometer_state", true); // Enable /odometer_state publishing
+        
         // Publishers
         whiteline_publisher_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
             "whiteline_points", 10);
@@ -65,6 +70,8 @@ public:
             "robot_pose", 10);
         odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>(
             "odom", 10);
+        odometer_state_publisher_ = this->create_publisher<booster_interface::msg::Odometer>(
+            "odometer_state", 10);
         marker_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
             "whiteline_markers", 10);
             
@@ -95,6 +102,10 @@ public:
         camera_params_.max_distance = max_distance_;
         camera_params_.fov = fov_;
         use_realistic_simulation_ = this->get_parameter("use_realistic_simulation").as_bool();
+        
+        // Get real robot compatibility parameters  
+        robot_odom_factor_ = this->get_parameter("robot.odom_factor").as_double();
+        publish_odometer_state_ = this->get_parameter("publish_odometer_state").as_bool();
         
         // Load or generate white line points and landmarks
         if (generate_soccer_field) {
@@ -262,10 +273,25 @@ private:
         
         // Set velocity based on control mode
         if (keyboard_control_) {
-            // For keyboard control, use the commanded velocities directly
-            odom_msg.twist.twist.linear.x = cmd_vel_linear_;
+            // For keyboard control, use the limited velocities (apply same limits as in updateKeyboardMovement)
+            const double ROBOT_MAX_SPEED_X_PLUS = 4.0 / 4.138;
+            const double ROBOT_MAX_SPEED_X_MINUS = -4.0 / 4.322;
+            const double ROBOT_MAX_SPEED_PI = 2 * M_PI / 4.492;
+            
+            double limited_linear_x = cmd_vel_linear_;
+            double limited_angular_z = cmd_vel_angular_;
+            
+            // Apply same speed limits
+            if (limited_linear_x > 0) {
+                limited_linear_x = std::min(limited_linear_x, ROBOT_MAX_SPEED_X_PLUS);
+            } else {
+                limited_linear_x = std::max(limited_linear_x, ROBOT_MAX_SPEED_X_MINUS);
+            }
+            limited_angular_z = std::max(-ROBOT_MAX_SPEED_PI, std::min(limited_angular_z, ROBOT_MAX_SPEED_PI));
+            
+            odom_msg.twist.twist.linear.x = limited_linear_x;
             odom_msg.twist.twist.linear.y = 0.0;  // No lateral movement for differential drive
-            odom_msg.twist.twist.angular.z = cmd_vel_angular_;
+            odom_msg.twist.twist.angular.z = limited_angular_z;
         } else {
             // For automatic movement, calculate velocity from position difference
             static auto last_time = current_time;
@@ -310,6 +336,18 @@ private:
         odom_msg.twist.covariance[35] = 0.02;  // vtheta
         
         odom_publisher_->publish(odom_msg);
+        
+        // Publish /odometer_state for real robot compatibility 
+        if (publish_odometer_state_) {
+            auto odometer_msg = booster_interface::msg::Odometer();
+            
+            // Apply robot odometry factor (real robot calibration)
+            odometer_msg.x = static_cast<float>(odom_pose_.x * robot_odom_factor_);
+            odometer_msg.y = static_cast<float>(odom_pose_.y * robot_odom_factor_);
+            odometer_msg.theta = static_cast<float>(odom_pose_.theta);
+            
+            odometer_state_publisher_->publish(odometer_msg);
+        }
         
         // Update previous poses for next iteration
         prev_robot_pose_ = robot_pose_;
@@ -840,19 +878,39 @@ private:
     
     void updateKeyboardMovement()
     {
+        // ロボットの速度に関連する定数（実際のロボット特性に基づく）
+        const double ROBOT_MAX_SPEED_X_PLUS = 4.0 / 4.138;   // 4.138秒で4m進むのが最大速度 (~0.967 m/s)
+        const double ROBOT_MAX_SPEED_X_MINUS = -4.0 / 4.322; // 4.322秒で4m下がるのが最大速度 (~-0.925 m/s)
+        // const double ROBOT_MAX_SPEED_Y = 4.0 / 10.55;     // 10.55秒で4m進むのが最大速度 (~0.379 m/s) - 現在は使用されていない
+        const double ROBOT_MAX_SPEED_PI = 2 * M_PI / 4.492;  // 4.492秒で360度回転が最大速度 (~1.398 rad/s)
+        
         double dt = 0.1;  // Time step for movement calculation
         
+        // Apply robot speed limits to commanded velocities
+        double limited_linear_x = cmd_vel_linear_;
+        double limited_angular_z = cmd_vel_angular_;
+        
+        // Limit linear velocity based on direction
+        if (limited_linear_x > 0) {
+            limited_linear_x = std::min(limited_linear_x, ROBOT_MAX_SPEED_X_PLUS);
+        } else {
+            limited_linear_x = std::max(limited_linear_x, ROBOT_MAX_SPEED_X_MINUS);
+        }
+        
+        // Limit angular velocity
+        limited_angular_z = std::max(-ROBOT_MAX_SPEED_PI, std::min(limited_angular_z, ROBOT_MAX_SPEED_PI));
+        
         // Update robot orientation first
-        double dtheta_true = cmd_vel_angular_ * dt;
+        double dtheta_true = limited_angular_z * dt;
         robot_pose_.theta += dtheta_true;
         
         // Normalize angle to [-pi, pi]
         while (robot_pose_.theta > M_PI) robot_pose_.theta -= 2 * M_PI;
         while (robot_pose_.theta < -M_PI) robot_pose_.theta += 2 * M_PI;
         
-        // Update robot position based on linear velocity in robot's local frame
-        double dx_true = cmd_vel_linear_ * dt * std::cos(robot_pose_.theta);
-        double dy_true = cmd_vel_linear_ * dt * std::sin(robot_pose_.theta);
+        // Update robot position based on limited linear velocity in robot's local frame
+        double dx_true = limited_linear_x * dt * std::cos(robot_pose_.theta);
+        double dy_true = limited_linear_x * dt * std::sin(robot_pose_.theta);
         
         robot_pose_.x += dx_true;
         robot_pose_.y += dy_true;
@@ -941,6 +999,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr landmarks_publisher_;
     rclcpp::Publisher<geometry_msgs::msg::Pose2D>::SharedPtr robot_pose_publisher_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_publisher_;
+    rclcpp::Publisher<booster_interface::msg::Odometer>::SharedPtr odometer_state_publisher_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_publisher_;
     
     // ROS2 subscriber
@@ -976,6 +1035,10 @@ private:
     bool keyboard_control_;   // Whether keyboard control is enabled
     double cmd_vel_linear_;   // Commanded linear velocity from keyboard
     double cmd_vel_angular_;  // Commanded angular velocity from keyboard
+    
+    // Real robot compatibility parameters
+    double robot_odom_factor_;   // Robot odometry correction factor
+    bool publish_odometer_state_; // Enable /odometer_state publishing
     
     // タイムスタンプ
     rclcpp::Time current_timestamp_;

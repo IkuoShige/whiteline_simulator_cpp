@@ -29,7 +29,9 @@ def generate_launch_description():
                 'fov': 1.5708,  # 90 degrees
                 'max_distance': 8.0,
                 'field_length': 14.0,
-                'field_width': 9.0
+                'field_width': 9.0,
+                'publish_odometer_state': True,
+                'robot.odom_factor': 1.0
             }]
         ),
         

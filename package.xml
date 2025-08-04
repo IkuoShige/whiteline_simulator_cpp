@@ -17,6 +17,7 @@
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
   <depend>visualization_msgs</depend>
+  <depend>booster_interface</depend>
   
   <exec_depend>teleop_twist_keyboard</exec_depend>
 

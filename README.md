@@ -5,11 +5,14 @@ This ROS2 package simulates white line detection and landmark recognition from a
 ## Features
 
 - **Soccer Field White Line Generation**: Automatically generates white line points for an AdultSize soccer field (14m x 9m)
-- **Landmark Detection**: Detects and classifies T-junctions, L-corners, X-crosses, and penalty marks
-- **Real-time Robot Simulation**: Simulates a robot moving on the field with configurable field of view (FOV) and detection range
-- **ROS2 Integration**: Publishes white line points, landmarks, robot pose, and visualization markers
-- **Configurable Parameters**: Adjustable field dimensions, point spacing, FOV, and detection parameters
-- **Visualization**: Full rviz2 support with markers for field and landmark visualization
+- **Landmark Detection**: Detects and classifies T-junctions, L-corners, X-crosses, penalty marks, and goal posts
+- **Realistic Robot Simulation**: Simulates robot movement with actual speed characteristics and constraints
+- **Robot-Local Coordinate System**: Publishes observation data in robot's coordinate frame for localization algorithms
+- **Realistic Camera Simulation**: Includes noise, detection probability, and field-of-view constraints
+- **Complete Odometry**: Publishes realistic odometry with movement limitations and uncertainty
+- **ROS2 Integration**: Full ROS2 Humble compatibility with proper TF frames (map→odom→base_link)
+- **Keyboard Control**: Interactive control with realistic movement speed limits
+- **Comprehensive Visualization**: Multi-layer RViz2 visualization showing both robot-local and global data
 
 ## Soccer Field Dimensions (AdultSize)
 
@@ -61,41 +64,53 @@ pixi run colcon build --packages-select whiteline_simulator_cpp
 
 ## Usage
 
-### 1. Generate Soccer Field Data
+### Quick Start with Keyboard Control
 
-Generate the soccer field white line points and landmarks:
+The easiest way to run the simulator with interactive keyboard control:
+
+```bash
+# Launch simulator with keyboard control
+pixi run wl_sim_keyboard
+
+# In another terminal, launch RViz2 for visualization  
+pixi run rviz
+```
+
+This launches:
+- Whiteline simulator node with realistic robot movement
+- Teleop keyboard node for robot control (use i/j/k/l keys)
+- Automatic soccer field generation with landmarks
+
+### Alternative Launch Methods
+
+#### 1. Basic Simulator with Auto-Generated Field
+
+```bash
+pixi run wl_sim
+```
+
+#### 2. Advanced Configuration
+
+Start the simulator with custom parameters:
+
+```bash
+pixi run ros2 launch whiteline_simulator_cpp whiteline_simulator.launch.py use_realistic_simulation:=true fov:=1.5708 max_distance:=8.0
+```
+
+#### 3. Manual Field Generation (Optional)
+
+Generate soccer field data files manually:
 
 ```bash
 pixi run ./install/whiteline_simulator_cpp/lib/whiteline_simulator_cpp/soccer_field_generator src/whiteline_simulator_cpp/data/soccer_field_points.txt 0.05 src/whiteline_simulator_cpp/data/soccer_field_landmarks.txt
 ```
 
-Parameters:
-- `output_file`: Path to white line points output file
-- `point_spacing`: Spacing between points in meters (default: 0.05m)
-- `landmarks_file`: Path to landmarks output file
+#### 4. Run Listener Node (Optional)
 
-### 2. Run the Simulator
-
-Start the white line and landmark simulator:
-
-```bash
-pixi run ros2 run whiteline_simulator_cpp whiteline_simulator_node --ros-args -p whiteline_points_file:=src/whiteline_simulator_cpp/data/soccer_field_points.txt -p landmarks_file:=src/whiteline_simulator_cpp/data/soccer_field_landmarks.txt -p generate_soccer_field:=false
-```
-
-### 3. Run the Listener (Optional)
-
-In another terminal, run the listener to see the detected white line points and landmarks:
+Monitor published data:
 
 ```bash
 pixi run ros2 run whiteline_simulator_cpp whiteline_listener
-```
-
-### 4. Visualize with RViz2
-
-Launch RViz2 with the provided configuration:
-
-```bash
-pixi run rviz2 -d src/whiteline_simulator_cpp/config/soccer_field_visualization.rviz
 ```
 
 ## Parameters
@@ -114,10 +129,47 @@ The simulator node accepts the following parameters:
 
 ## Published Topics
 
-- `/whiteline_points` (std_msgs/Float32MultiArray): Detected white line points
-- `/landmarks` (std_msgs/Float32MultiArray): Detected landmarks with types and orientations
-- `/robot_pose` (geometry_msgs/Pose2D): Current robot pose
-- `/whiteline_markers` (visualization_msgs/MarkerArray): Visualization markers for RViz2
+The simulator publishes the following ROS2 topics with realistic robot observation data:
+
+### Core Sensor Data
+- `/whiteline_points` (std_msgs/Float32MultiArray): Detected white line points in **robot-local coordinates** 
+  - Data format: [x1, y1, x2, y2, x3, y3, ...] in meters
+  - Coordinates relative to robot's base_link frame (+x forward, +y left)
+  - Includes realistic camera simulation with noise and detection probability
+  
+- `/landmarks` (std_msgs/Float32MultiArray): Detected landmarks in **robot-local coordinates**
+  - Data format: [x1, y1, type1, orientation1, x2, y2, type2, orientation2, ...]
+  - Coordinates relative to robot's base_link frame (+x forward, +y left)  
+  - Types: 0=T_JUNCTION, 1=L_CORNER, 2=X_CROSS, 3=PENALTY_MARK, 4=GOAL_POST
+  - Orientations in radians relative to robot frame
+
+### Robot State Information
+- `/robot_pose` (geometry_msgs/Pose2D): Current robot pose in global (map) coordinates
+  - Position (x, y) in meters relative to field center
+  - Orientation (theta) in radians
+  
+- `/odom` (nav_msgs/Odometry): Robot odometry with realistic movement characteristics
+  - Header with timestamp and odom frame
+  - Pose: position and orientation in odom frame 
+  - Twist: linear and angular velocities with realistic robot speed limits
+  - Covariance matrices for pose and twist uncertainty
+
+### Visualization
+- `/whiteline_markers` (visualization_msgs/MarkerArray): RViz2 visualization markers
+  - Robot pose and field-of-view indicators
+  - All soccer field elements (white lines, landmarks) in global coordinates  
+  - Detected elements in both robot-local and global coordinates
+  - Color-coded markers by landmark type and detection status
+
+## Realistic Robot Movement Characteristics
+
+The simulator incorporates realistic robot speed limitations based on actual robot performance:
+
+- **Forward speed**: ~0.967 m/s (4.138 seconds to travel 4m)
+- **Backward speed**: ~0.925 m/s (4.322 seconds to travel 4m)
+- **Rotational speed**: ~1.398 rad/s (4.492 seconds for 360° rotation)
+
+These limits are applied to both keyboard control and odometry calculations, ensuring realistic simulation behavior.
 
 ## Example Usage with Custom Parameters
 
